@@ -17,7 +17,6 @@
 """
 
 import socket
-
 import inspect
 import multio
 from psycopg2 import OperationalError, connect
@@ -44,6 +43,30 @@ class Connection(object):
         #: The current connection lock. This prevents multiple cursors from executing at the same
         #: time.
         self._lock = multio.Lock()
+
+        self._has_reader_task = None
+        self._read_request = None
+        self._wait_read_lock = multio.Lock()
+        self._notifications_available = multio.Event()
+
+    async def keep_reading(self):
+        """Normally, we only read from the socket when psycopg2 expects data.
+
+        To get notifications as soon as they are sent, rather than after the
+        next query you submit, or manually calling `poll` in intervals,
+        use this method to keep reading indefinitely.
+        """
+        self._has_reader_task = True
+        try:
+            while True:
+                async with self._wait_read_lock:
+                    await multio.asynclib.wait_read(self._sock)
+                if self._read_request:
+                    await self._read_request.put(None)
+                else:
+                    await self.poll()
+        finally:
+            self._has_reader_task = False
 
     async def __aenter__(self):
         return self
@@ -75,6 +98,13 @@ class Connection(object):
         await conn._connect(*args, **kwargs)
         return conn
 
+    async def get_notifications(self):
+        await self._notifications_available.wait()
+        self._notifications_available.clear()
+        result = self._connection.notifies[:]
+        self._connection.notifies.clear()
+        return result
+
     async def _wait_callback(self):
         """
         The wait callback. This callback is used for polling the psycopg2 sockets, waiting until
@@ -83,10 +113,18 @@ class Connection(object):
         while True:
             state = self._connection.poll()
             if state == POLL_OK:
+                if self._connection.notifies:
+                    await self._notifications_available.set()
                 return
 
             elif state == POLL_READ:
-                await multio.asynclib.wait_read(self._sock)
+                if self._has_reader_task:
+                    self._read_request = multio.Queue(0)
+                    await self._read_request.get()
+                    self._read_request = None
+                else:
+                    async with self._wait_read_lock:
+                        await multio.asynclib.wait_read(self._sock)
 
             elif state == POLL_WRITE:
                 await multio.asynclib.wait_write(self._sock)
